@@ -1,5 +1,4 @@
 package agent
-package agent
 
 import (
 	"context"

@@ -49,6 +49,10 @@ type Agent struct {
 
 // New creates a new agent instance.
 func New(cfg Config, logger *slog.Logger) (*Agent, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	// Ensure workspace exists.
 	if err := os.MkdirAll(cfg.Workspace, 0755); err != nil {
 		return nil, fmt.Errorf("creating workspace directory: %w", err)
@@ -130,8 +134,8 @@ func (a *Agent) collectMetrics() Metrics {
 
 	// Disk usage for workspace.
 	if stat, err := diskUsage(a.config.Workspace); err == nil {
-		m.DiskTotalMB = stat.Total / (1024 * 1024)
-		m.DiskUsedMB = stat.Used / (1024 * 1024)
+		m.DiskTotalMB = int64(stat.Total / (1024 * 1024))
+		m.DiskUsedMB = int64(stat.Used / (1024 * 1024))
 	}
 
 	return m
