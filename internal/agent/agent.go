@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"time"
 )
 
@@ -44,7 +43,6 @@ type Message struct {
 type Agent struct {
 	config Config
 	logger *slog.Logger
-	mu     sync.Mutex
 }
 
 // New creates a new agent instance.
@@ -121,7 +119,7 @@ func (a *Agent) collectMetrics() Metrics {
 	// Read memory info from /proc/meminfo.
 	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
 		var total, available int64
-		fmt.Sscanf(string(data), "MemTotal: %d kB", &total)
+		_, _ = fmt.Sscanf(string(data), "MemTotal: %d kB", &total)
 		// Find MemAvailable line.
 		for _, line := range splitLines(string(data)) {
 			if n, _ := fmt.Sscanf(line, "MemAvailable: %d kB", &available); n == 1 {
@@ -197,14 +195,14 @@ func (a *Agent) handleConnection(ctx context.Context, conn net.Conn) {
 
 		switch msg.Type {
 		case "ping":
-			encoder.Encode(Message{Type: "pong"})
+			_ = encoder.Encode(Message{Type: "pong"})
 		case "metrics":
 			m := a.collectMetrics()
 			payload, _ := json.Marshal(m)
-			encoder.Encode(Message{Type: "metrics", Payload: payload})
+			_ = encoder.Encode(Message{Type: "metrics", Payload: payload})
 		case "shutdown":
 			a.logger.Info("shutdown requested by host")
-			encoder.Encode(Message{Type: "ack"})
+			_ = encoder.Encode(Message{Type: "ack"})
 			return
 		default:
 			a.logger.Warn("unknown message type", "type", msg.Type)
