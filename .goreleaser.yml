@@ -1,0 +1,75 @@
+version: 2
+
+project_name: caged-agent
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/agent
+    binary: caged-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: caged-agent
+    repository:
+      owner: caged-dev
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/caged-dev/agent"
+    description: "Lightweight agent that runs inside Caged sandbox VMs"
+    license: "MIT"
+    test: |
+      system "#{bin}/caged-agent", "--version"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/caged-dev/agent:{{ .Version }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    goarch: amd64
+  - image_templates:
+      - "ghcr.io/caged-dev/agent:{{ .Version }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/caged-dev/agent:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/caged-dev/agent:{{ .Version }}-amd64"
+      - "ghcr.io/caged-dev/agent:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/caged-dev/agent:latest"
+    image_templates:
+      - "ghcr.io/caged-dev/agent:{{ .Version }}-amd64"
+      - "ghcr.io/caged-dev/agent:{{ .Version }}-arm64"
