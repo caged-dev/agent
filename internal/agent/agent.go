@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/caged-dev/agent/internal/watcher"
 )
 
 // Config holds agent configuration.
@@ -20,6 +22,19 @@ type Config struct {
 	LogLevel          string
 	HeartbeatInterval time.Duration
 	MetricsInterval   time.Duration
+
+	// WatchFiles enables the workspace file change watcher. On by default
+	// in cmd/agent: a sandbox whose file changes are not observed is a
+	// sandbox Caged is describing incorrectly.
+	WatchFiles bool
+	// WatchDebounce is how long a path must be quiet before its coalesced
+	// change is reported. Zero takes watcher.DefaultDebounce.
+	WatchDebounce time.Duration
+	// WatchRateLimit caps sustained reported changes per second. Zero
+	// takes watcher.DefaultRatePerSecond.
+	WatchRateLimit int
+	// WatchIgnoreDirs overrides watcher.DefaultIgnoreDirs when non-nil.
+	WatchIgnoreDirs []string
 }
 
 // Metrics holds system metrics collected by the agent.
@@ -39,10 +54,19 @@ type Message struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-// Agent runs inside the sandbox VM, reporting health and metrics.
+// Agent runs inside the sandbox VM, reporting health and metrics and
+// observing file changes in the workspace.
 type Agent struct {
 	config Config
 	logger *slog.Logger
+
+	// watcher is nil when file observation is off — either disabled by
+	// configuration or unsupported on this platform. Nil is a legitimate
+	// state and is REPORTED to a subscriber rather than looking like a
+	// workspace where nothing ever changes.
+	watcher             *watcher.Watcher
+	watchDisabledReason string
+	hub                 *fileOpHub
 }
 
 // New creates a new agent instance.
@@ -56,19 +80,80 @@ func New(cfg Config, logger *slog.Logger) (*Agent, error) {
 		return nil, fmt.Errorf("creating workspace directory: %w", err)
 	}
 
-	return &Agent{
+	a := &Agent{
 		config: cfg,
 		logger: logger,
-	}, nil
+		hub:    newFileOpHub(logger),
+	}
+
+	if cfg.WatchFiles {
+		w, err := watcher.New(watcher.Config{
+			Root:          cfg.Workspace,
+			Debounce:      cfg.WatchDebounce,
+			RatePerSecond: cfg.WatchRateLimit,
+			IgnoreDirs:    cfg.WatchIgnoreDirs,
+		}, logger)
+		switch {
+		case err == nil:
+			a.watcher = w
+		default:
+			// A watcher that cannot start must not stop the sandbox from
+			// running the customer's workload. It is loud, and the reason
+			// travels to the host on every subscription, so the gap is
+			// visible instead of looking like an idle workspace.
+			a.watchDisabledReason = err.Error()
+			logger.Error("file change observation is OFF: the workspace watcher could not start",
+				"workspace", cfg.Workspace,
+				"error", err,
+				"consequence", "file changes made inside this sandbox will not appear in the session timeline")
+		}
+	} else {
+		a.watchDisabledReason = "file watching is disabled by configuration (CAGED_WATCH_FILES=false)"
+	}
+
+	return a, nil
 }
 
 // Run starts the agent's main loop. It blocks until ctx is cancelled.
+//
+// Every goroutine it starts is bounded by ctx, and the watcher is closed
+// before Run returns, so a shutdown leaks neither the inotify descriptor
+// nor the fan-out goroutine.
 func (a *Agent) Run(ctx context.Context) error {
 	// Start heartbeat loop.
 	go a.heartbeatLoop(ctx)
 
 	// Start metrics collection loop.
 	go a.metricsLoop(ctx)
+
+	// Start the workspace watcher and the fan-out to subscribed hosts.
+	if a.watcher != nil {
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			if err := a.watcher.Run(ctx); err != nil && ctx.Err() == nil {
+				a.logger.Error("workspace watcher stopped; file changes are no longer observed",
+					"error", err)
+			}
+		}()
+		hubDone := make(chan struct{})
+		go func() {
+			defer close(hubDone)
+			a.runFileOpHub(ctx)
+		}()
+		defer func() {
+			// Close releases the inotify descriptor, which ends
+			// watcher.Run, which closes its event channel, which ends the
+			// hub. Waiting on both is what makes "no leaked watcher"
+			// testable rather than merely intended.
+			if err := a.watcher.Close(); err != nil {
+				a.logger.Warn("closing workspace watcher", "error", err)
+			}
+			<-watchDone
+			<-hubDone
+		}()
+		a.logger.Info("file change observation on", "workspace", a.config.Workspace)
+	}
 
 	// Listen for host commands on the socket.
 	if err := a.listenSocket(ctx); err != nil && ctx.Err() == nil {
@@ -200,6 +285,11 @@ func (a *Agent) handleConnection(ctx context.Context, conn net.Conn) {
 			m := a.collectMetrics()
 			payload, _ := json.Marshal(m)
 			_ = encoder.Encode(Message{Type: "metrics", Payload: payload})
+		case MsgWatchFiles:
+			// This connection becomes a one-way stream from here on: the
+			// host asked for changes, not for a request/response session.
+			a.streamFileOps(ctx, conn, encoder)
+			return
 		case "shutdown":
 			a.logger.Info("shutdown requested by host")
 			_ = encoder.Encode(Message{Type: "ack"})
